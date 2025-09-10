@@ -1,0 +1,178 @@
+name: Build CEF with MP3/MP4 Support
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      cef_branch:
+        description: 'CEF Branch (e.g., 4430 for Chrome 90.6.7)'
+        required: true
+        default: '4430'
+        type: string
+      architecture:
+        description: 'Build Architecture'
+        required: true
+        default: 'x64'
+        type: choice
+        options:
+        - x64
+        - x86
+        - arm64
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    
+    strategy:
+      matrix:
+        config: [Release]
+        arch: [x64]
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Setup Git
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+        git config --global core.autocrlf false
+        git config --global core.filemode false
+    
+    - name: Install dependencies
+      run: |
+        # 安装必要的工具
+        choco install wget -y
+        refreshenv
+    
+    - name: Setup Visual Studio environment
+      uses: microsoft/setup-msbuild@v1.3
+      with:
+        vs-version: '17.0'
+    
+    - name: Configure build environment
+      shell: cmd
+      run: |
+        call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+        echo "Visual Studio environment configured"
+    
+    - name: Download CEF sources
+      shell: cmd
+      run: |
+        set DOWNLOAD_DIR=%GITHUB_WORKSPACE%\chromium_git
+        if not exist %DOWNLOAD_DIR% (mkdir %DOWNLOAD_DIR%)
+        
+        set DEPOT_TOOLS_DIR=%GITHUB_WORKSPACE%\depot_tools
+        if not exist %DEPOT_TOOLS_DIR% (
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git %DEPOT_TOOLS_DIR%
+        )
+        
+        del /F /Q automate-git.py 2>nul || echo "File not found"
+        wget -q https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate-git.py
+        
+        set CEF_BRANCH=${{ github.event.inputs.cef_branch || '4430' }}
+        echo "Building CEF branch: %CEF_BRANCH%"
+        
+        python automate-git.py --download-dir=%DOWNLOAD_DIR% --depot-tools-dir=%DEPOT_TOOLS_DIR% --no-distrib --no-build --branch=%CEF_BRANCH%
+    
+    - name: Build CEF
+      shell: cmd
+      run: |
+        set DOWNLOAD_DIR=%GITHUB_WORKSPACE%\chromium_git
+        set DEPOT_TOOLS_DIR=%GITHUB_WORKSPACE%\depot_tools
+        
+        REM 设置 Visual Studio 环境
+        set vs_root=C:\Program Files\Microsoft Visual Studio\2022\Enterprise
+        set sdk_root=C:\Program Files (x86)\Windows Kits\10
+        set sdk_version=10.0.22621.0
+        set vc_tools_version=14.39.33519
+        set vc_redist_version=14.38.33135
+        set vc_redist_crt=Microsoft.VC143.CRT
+        set arch=${{ matrix.arch }}
+        
+        REM 设置 CEF 构建参数
+        set CEF_USE_GN=1
+        set GN_DEFINES=is_official_build=true ffmpeg_branding=Chrome proprietary_codecs=true chrome_pgo_phase=0
+        set GYP_DEFINES=buildtype=Official
+        set GYP_MSVS_VERSION=2022
+        set CEF_ARCHIVE_FORMAT=tar.bz2
+        
+        set GYP_GENERATORS=ninja,msvs-ninja
+        set GN_ARGUMENTS=--ide=vs%GYP_MSVS_VERSION% --sln=cef --filters=//cef/*
+        
+        set WIN_CUSTOM_TOOLCHAIN=1
+        set CEF_VCVARS=none
+        set GYP_MSVS_OVERRIDE_PATH=%vs_root%
+        
+        REM 设置路径
+        set PATH=%sdk_root%\bin\%sdk_version%\%arch%;%vs_root%\VC\Tools\MSVC\%vc_tools_version%\bin\HostX86\%arch%;%vs_root%\VC\Tools\MSVC\%vc_tools_version%\bin\HostX64\%arch%;%PATH%
+        set INCLUDE=%sdk_root%\Include\%sdk_version%\um;%sdk_root%\Include\%sdk_version%\ucrt;%sdk_root%\Include\%sdk_version%\shared;%vs_root%\VC\Tools\MSVC\%vc_tools_version%\include;%INCLUDE%
+        set LIB=%sdk_root%\Lib\%sdk_version%\um\%arch%;%sdk_root%\Lib\%sdk_version%\ucrt\%arch%;%vs_root%\VC\Tools\MSVC\%vc_tools_version%\lib\%arch%;%LIB%
+        
+        set CEF_BRANCH=${{ github.event.inputs.cef_branch || '4430' }}
+        echo "Building CEF branch: %CEF_BRANCH%"
+        
+        REM 执行构建
+        python automate-git.py --download-dir=%DOWNLOAD_DIR% --depot-tools-dir=%DEPOT_TOOLS_DIR% --no-update --no-debug-build --build-log-file --force-distrib --minimal-distrib --client-distrib --verbose-build --%arch%-build --branch=%CEF_BRANCH%
+    
+    - name: Package build artifacts
+      shell: cmd
+      run: |
+        set DOWNLOAD_DIR=%GITHUB_WORKSPACE%\chromium_git
+        set CEF_BRANCH=${{ github.event.inputs.cef_branch || '4430' }}
+        
+        REM 查找构建输出
+        for /r "%DOWNLOAD_DIR%" %%i in (cef_binary_*) do (
+          echo "Found build output: %%i"
+          if exist "%%i" (
+            move "%%i" "%GITHUB_WORKSPACE%\cef_binary_output"
+          )
+        )
+    
+    - name: Upload CEF binary
+      uses: actions/upload-artifact@v3
+      with:
+        name: cef-binary-${{ matrix.arch }}-${{ github.event.inputs.cef_branch || '4430' }}
+        path: |
+          cef_binary_output/
+          *.log
+        retention-days: 30
+    
+    - name: Create Release (on tag)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          cef_binary_output/*.tar.bz2
+          cef_binary_output/*.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-matrix:
+    if: github.event.inputs.architecture != ''
+    runs-on: windows-2022
+    
+    strategy:
+      matrix:
+        arch: ['${{ github.event.inputs.architecture }}']
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+    
+    # 重复上面的构建步骤，但使用输入的架构参数
+    - name: Build with custom architecture
+      shell: cmd
+      run: |
+        echo "Building for architecture: ${{ matrix.arch }}"
+        REM 这里可以复制上面的构建逻辑
