@@ -1165,8 +1165,8 @@ if not branch_is_master:
 
   # Verify the minimum supported branch number.
   if int(cef_branch) < 4430:
-    print('The requested branch (%s) is too old to build using this tool. ' +
-          'The minimum supported branch is 4430.' % cef_branch)
+    print(('The requested branch (%s) is too old to build using this tool. ' +
+           'The minimum supported branch is 4430.') % cef_branch)
     sys.exit(1)
 
 # True if the requested branch is 7151 or older.

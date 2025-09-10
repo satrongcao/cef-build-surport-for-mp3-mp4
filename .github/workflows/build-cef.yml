@@ -79,8 +79,8 @@ jobs:
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git %DEPOT_TOOLS_DIR%
         )
         
-        del /F /Q automate-git.py 2>nul || echo "File not found"
-        wget -q https://bitbucket.org/chromiumembedded/cef/raw/master/tools/automate/automate-git.py
+        REM 使用仓库中已修复的 automate-git.py 文件，不再重新下载
+        echo "Using local automate-git.py file with fixes"
         
         set CEF_BRANCH=${{ github.event.inputs.cef_branch || '4430' }}
         echo "Building CEF branch: %CEF_BRANCH%"
