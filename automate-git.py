@@ -5,24 +5,27 @@
 from __future__ import absolute_import
 from __future__ import print_function
 from datetime import datetime
+import hashlib
 from io import open
 from optparse import OptionParser
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
+import threading
+import time
 import zipfile
 
-is_python2 = sys.version_info.major == 2
+if sys.version_info.major != 3:
+  sys.stderr.write('Python3 is required!')
+  sys.exit(1)
 
-if is_python2:
-  from urllib import FancyURLopener
-  from urllib2 import urlopen
-else:
-  from urllib.request import FancyURLopener, urlopen
+from urllib.request import FancyURLopener, urlopen
 
 ##
 # Default URLs.
@@ -41,7 +44,117 @@ cef_git_url = 'https://bitbucket.org/chromiumembedded/cef.git'
 script_dir = os.path.dirname(__file__)
 
 ##
-# Helper functions.
+# Helper functions for parallel execution.
+##
+
+_COLOR_RED = '\033[31m'
+_COLOR_BOLD = '\033[1m'
+_COLOR_RESET = '\033[0m'
+
+
+def _stderr_msg(msg):
+  return _COLOR_RED + _COLOR_BOLD + msg + _COLOR_RESET
+
+
+def _printer_thread(q):
+  """ Serializes printing to stdout. """
+  while True:
+    message = q.get()
+
+    # Use a sentinel value to signal termination.
+    if message is None:
+      break
+    print(message)
+
+    # Indicate that the task is complete.
+    q.task_done()
+
+
+def _read_stdout_thread(process, name, q):
+  """ Reads output from a process's stdout and prints it with a process identifier. """
+  start_time = time.time()
+
+  for line in iter(process.stdout.readline, b''):
+    q.put(f"[{name}] {line.decode().strip()}")
+
+  # The pipe has closed so the process should be exiting.
+  process.wait()
+
+  elapsed_time = time.time() - start_time
+
+  returncode = process.returncode
+  if returncode == 0:
+    q.put(f"[{name}] Exited with code 0")
+  else:
+    q.put(_stderr_msg(f"[{name}] ERROR Exited with code {returncode}"))
+
+  q.put(f"[{name}] Execution time: {elapsed_time:.4f} seconds")
+
+
+def _read_stderr_thread(process, name, q):
+  """ Reads output from a process's stdout and prints it with a process identifier. """
+  for line in iter(process.stderr.readline, b''):
+    q.put(_stderr_msg(f"[{name}] {line.decode().strip()}"))
+
+
+def run_parallel(commands):
+  """ Run multiple commands (command_line, working_dir pairs) in parallel.
+      Returns the number of commands that succeeded (returned exit code 0). """
+  assert len(commands) > 1
+
+  if options.dryrun:
+    for i, command in enumerate(commands):
+      print(f"[Process {i+1}] Running \"{command[0]}\" in \"{command[1]}\"")
+    return len(commands)
+
+  processes = []
+  threads = []
+
+  print_queue = queue.Queue()
+
+  # Start the printer thread.
+  printer = threading.Thread(target=_printer_thread, args=(print_queue,))
+  printer.daemon = True
+  printer.start()
+
+  # Start processes and create threads to read output.
+  for i, command in enumerate(commands):
+    name = f"Process {i+1}"
+    cmd = command[0]
+    cwd = command[1]
+
+    print(f"[{name}] Running \"{cmd}\" in \"{cwd}\"")
+
+    args = shlex.split(cmd.replace('\\', '\\\\'))
+    process = subprocess.Popen(
+        args, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    processes.append(process)
+
+    thread = threading.Thread(
+        target=_read_stdout_thread, args=(process, name, print_queue))
+    thread.daemon = True
+    thread.start()
+    threads.append(thread)
+
+    thread = threading.Thread(
+        target=_read_stderr_thread, args=(process, name, print_queue))
+    thread.daemon = True
+    thread.start()
+    threads.append(thread)
+
+  # Wait for all threads to finish.
+  for thread in threads:
+    thread.join()
+
+  # Signal the printer thread to terminate.
+  print_queue.put(None)
+  printer.join()
+
+  return sum([process.returncode == 0 for process in processes])
+
+
+##
+# Helper functions for serial execution.
 ##
 
 
@@ -50,13 +163,8 @@ def msg(message):
   sys.stdout.write('--> ' + message + "\n")
 
 
-def run(command_line, working_dir, depot_tools_dir=None, output_file=None):
+def run(command_line, working_dir, output_file=None):
   """ Runs the specified command. """
-  # add depot_tools to the path
-  env = os.environ
-  if not depot_tools_dir is None:
-    env['PATH'] = depot_tools_dir + os.pathsep + env['PATH']
-
   sys.stdout.write('-------- Running "'+command_line+'" in "'+\
                    working_dir+'"...'+"\n")
   if not options.dryrun:
@@ -64,19 +172,18 @@ def run(command_line, working_dir, depot_tools_dir=None, output_file=None):
 
     if not output_file:
       return subprocess.check_call(
-          args, cwd=working_dir, env=env, shell=(sys.platform == 'win32'))
+          args, cwd=working_dir, shell=(sys.platform == 'win32'))
     try:
       msg('Writing %s' % output_file)
       with open(output_file, 'w', encoding='utf-8') as fp:
         return subprocess.check_call(
             args,
             cwd=working_dir,
-            env=env,
             shell=(sys.platform == 'win32'),
             stderr=subprocess.STDOUT,
             stdout=fp)
     except subprocess.CalledProcessError:
-      msg('ERROR Run failed. See %s for output.' % output_file)
+      msg(_stderr_msg('ERROR Run failed. See %s for output.' % output_file))
       raise
 
 
@@ -117,7 +224,15 @@ def move_directory(source, target, allow_overwrite=False):
   if os.path.exists(source):
     msg("Moving directory %s to %s" % (source, target))
     if not options.dryrun:
-      shutil.move(source, target)
+      try:
+        # This will fail if |source| and |target| are on different filesystems,
+        # or if files in |source| are currently locked.
+        os.rename(source, target)
+      except OSError:
+        msg(
+            _stderr_msg('ERROR Failed to move directory %s to %s' % (source,
+                                                                     target)))
+        raise
 
 
 def is_git_checkout(path):
@@ -165,18 +280,45 @@ def get_git_url(path):
   return 'Unknown'
 
 
-def download_and_extract(src, target):
+def is_valid_sha256(hash_string):
+  """ Returns true if |value| is a valid hex-encoded SHA256 hash. """
+  if len(hash_string) != 64:
+    return False
+  if not re.fullmatch(r'[0-9a-fA-F]+', hash_string):
+    return False
+  return True
+
+
+def sha256_of_file(file_path):
+  """ Returns the lower-case hex-encoded SHA256 hash for |file_path| contents. """
+  sha256_hash = hashlib.sha256()
+  with open(file_path, "rb") as f:
+    for chunk in iter(lambda: f.read(4096), b""):
+      sha256_hash.update(chunk)
+  return sha256_hash.hexdigest()
+
+
+def download_and_extract(src, target, strip_components=0, sha256_hash=''):
   """ Extracts the contents of src, which may be a URL or local file, to the
       target directory. """
   temporary = False
 
+  extension = None
+  for ext in ('.zip', '.tar.bz2', '.tar.xz'):
+    if src.lower().endswith(ext):
+      extension = ext
+      break
+  if extension is None:
+    raise Exception('Unsupported file extension for: ' + src)
+
   if src[:4] == 'http':
     # Attempt to download a URL.
+    msg('Downloading %s' % src)
     opener = FancyURLopener({})
     response = opener.open(src)
 
     temporary = True
-    handle, archive_path = tempfile.mkstemp(suffix='.zip')
+    handle, archive_path = tempfile.mkstemp(suffix=extension)
     os.write(handle, response.read())
     os.close(handle)
   elif os.path.exists(src):
@@ -185,18 +327,81 @@ def download_and_extract(src, target):
   else:
     raise Exception('Path type is unsupported or does not exist: ' + src)
 
-  if not zipfile.is_zipfile(archive_path):
-    raise Exception('Not a valid zip archive: ' + src)
+  if len(sha256_hash) == 64:
+    hash = sha256_of_file(archive_path)
+    if hash != sha256_hash.lower():
+      raise Exception('SHA256 hash check failed for: ' + archive_path)
+    msg('SHA56 hash %s verified for %s' % (sha256_hash, archive_path))
 
-  # Attempt to extract the archive file.
-  try:
-    os.makedirs(target)
-    zf = zipfile.ZipFile(archive_path, 'r')
-    zf.extractall(target)
-  except:
-    shutil.rmtree(target, onerror=onerror)
-    raise
-  zf.close()
+  msg('Extracting ' + archive_path)
+
+  if extension == '.zip':
+    if not zipfile.is_zipfile(archive_path):
+      raise Exception('Not a valid zip archive: ' + archive_path)
+
+    # Attempt to extract the archive file.
+    try:
+      os.makedirs(target)
+      zf = zipfile.ZipFile(archive_path, 'r')
+      zf.extractall(target)
+    except:
+      shutil.rmtree(target, onerror=onerror)
+      raise
+    zf.close()
+  elif extension.startswith('.tar'):
+    if sys.platform == 'win32' and sys.getwindowsversion().build < 22000:
+      # Windows versions prior to Windows 11 do not have a reliable tar command.
+      # Use the builtin Python tar support instead.
+      assert strip_components <= 1, strip_components
+
+      def get_first_directory(path):
+        """ Returns the full path of the first directory found within |path|. """
+        for entry in os.scandir(path):
+          if entry.is_dir():
+            return os.path.join(path, entry.name)
+        return None
+
+      mode = ''
+      if extension.endswith('.bz2'):
+        mode = 'bz2'
+      elif extension.endswith('.xz'):
+        mode = 'xz'
+      # Use a temp directory on the same filesystem to support atomic move.
+      tmp_path = target + '.tmp'
+      try:
+        with tarfile.open(archive_path, 'r:' + mode) as tar:
+          if strip_components == 0:
+            # Extract directly to the target directory.
+            os.makedirs(target)
+            tar.extractall(path=target)
+          elif strip_components == 1:
+            # Extract to a temp directory and then move the first sub-folder
+            # to the target directory.
+            tar.extractall(path=tmp_path)
+            tmp_subdir_path = get_first_directory(tmp_path)
+            if not tmp_subdir_path is None:
+              shutil.move(tmp_subdir_path, target)
+      except:
+        shutil.rmtree(target, onerror=onerror)
+        raise
+      if os.path.isdir(tmp_path):
+        shutil.rmtree(tmp_path, onerror=onerror)
+    else:
+      mode = ''
+      if extension.endswith('.bz2'):
+        mode = 'j'
+      elif extension.endswith('.xz'):
+        mode = 'J'
+      # TODO: Add support for utilizing multiple cores.
+      cmd = 'tar x%sf "%s" -C "%s"' % (mode, archive_path, target)
+      if strip_components > 0:
+        cmd += ' --strip-components=%d' % strip_components
+      try:
+        os.makedirs(target)
+        run(cmd, target)
+      except:
+        shutil.rmtree(target, onerror=onerror)
+        raise
 
   # Delete the archive file if temporary.
   if temporary and os.path.exists(archive_path):
@@ -212,19 +417,12 @@ def read_file(path):
     raise Exception("Path does not exist: %s" % (path))
 
 
-def write_fp(fp, data):
-  if is_python2:
-    fp.write(data.decode('utf-8'))
-  else:
-    fp.write(data)
-
-
 def write_file(path, data):
   """ Write a file. """
   msg('Writing %s' % path)
   if not options.dryrun:
     with open(path, 'w', encoding='utf-8') as fp:
-      write_fp(fp, data)
+      fp.write(data)
 
 
 def read_config_file(path):
@@ -259,14 +457,41 @@ def write_branch_config_file(path, branch):
     write_config_file(config_file, {'branch': branch})
 
 
-def apply_patch(name):
+def read_version_file(path):
+  """ Read and parse a version file (key=value pairs, one per line). """
+  contents = read_file(path)
+  if contents is None:
+    return None
+  result = {}
+  lines = contents.split("\n")
+  for line in lines:
+    parts = line.split('=', 1)
+    if len(parts) == 2:
+      result[parts[0]] = parts[1]
+  return result
+
+
+def read_chrome_version_file(src_path):
+  path = os.path.join(src_path, 'chrome', 'VERSION')
+  parts = read_version_file(path)
+  if parts is None:
+    raise Exception('Failed to read %s' % path)
+  return '%s.%s.%s.%s' % (parts['MAJOR'], parts['MINOR'], parts['BUILD'],
+                          parts['PATCH'])
+
+
+def apply_patch(name, patch_dir=None, required=False):
   patch_file = os.path.join(cef_dir, 'patch', 'patches', name)
-  if os.path.exists(patch_file + ".patch"):
+  if patch_dir is None:
+    patch_dir = chromium_src_dir
+  patch_path = patch_file + ".patch"
+  if os.path.exists(patch_path):
     # Attempt to apply the patch file.
     patch_tool = os.path.join(cef_dir, 'tools', 'patcher.py')
     run('%s %s --patch-file "%s" --patch-dir "%s"' %
-        (python_exe, patch_tool, patch_file,
-         chromium_src_dir), chromium_src_dir, depot_tools_dir)
+        (python_exe, patch_tool, patch_file, patch_dir), chromium_src_dir)
+  elif required:
+    raise Exception('Required patch file does not exist: ' + patch_path)
 
 
 def apply_deps_patch():
@@ -289,8 +514,7 @@ def run_patch_updater(args='', output_file=None):
   tool = os.path.join(cef_src_dir, 'tools', 'patch_updater.py')
   if len(args) > 0:
     args = ' ' + args
-  run('%s %s%s' % (python_exe, tool, args), cef_src_dir, depot_tools_dir,
-      output_file)
+  run('%s %s%s' % (python_exe, tool, args), cef_src_dir, output_file)
 
 
 def onerror(func, path, exc_info):
@@ -440,26 +664,31 @@ def check_pattern_matches(output_file=None):
           if not skip:
             if write_msg:
               if has_output:
-                write_fp(fp, '\n')
-              write_fp(fp,
-                       '!!!! WARNING: FOUND PATTERN: %s\n' % entry['pattern'])
+                fp.write('\n')
+              fp.write('!!!! WARNING: FOUND PATTERN: %s\n' % entry['pattern'])
               if 'message' in entry:
-                write_fp(fp, entry['message'] + '\n')
-              write_fp(fp, '\n')
+                fp.write(entry['message'] + '\n')
+              fp.write('\n')
               write_msg = False
-            write_fp(fp, line + '\n')
+            fp.write(line + '\n')
             has_output = True
 
     if not output_file is None:
       if has_output:
-        msg('ERROR Matches found. See %s for output.' % out_file)
+        msg(_stderr_msg('ERROR Matches found. See %s for output.' % out_file))
       else:
-        write_fp(fp, 'Good news! No matches.\n')
+        fp.write('Good news! No matches.\n')
       fp.close()
 
     if has_output:
       # Don't continue when we know the build will be wrong.
       sys.exit(1)
+
+
+def invalid_options_combination(a, b):
+  print("Invalid combination of options: '%s' and '%s'" % (a, b))
+  parser.print_help(sys.stderr)
+  sys.exit(1)
 
 
 ##
@@ -491,9 +720,16 @@ parser.add_option(
     metavar='DIR',
     help='Download directory for depot_tools.',
     default='')
-parser.add_option('--depot-tools-archive', dest='depottoolsarchive',
-                  help='Zip archive file that contains a single top-level '+\
-                       'depot_tools directory.', default='')
+parser.add_option(
+    '--depot-tools-archive',
+    dest='depottoolsarchive',
+    help='Archive file that contains a single top-level depot_tools directory.',
+    default='')
+parser.add_option(
+    '--depot-tools-archive-sha256',
+    dest='depottoolsarchivesha256',
+    help='SHA256 hex-encoded hash for the file passed to --depot-tools-archive.',
+    default='')
 parser.add_option('--branch', dest='branch',
                   help='Branch of CEF to build (master, 3987, ...). This '+\
                        'will be used to name the CEF download directory and '+\
@@ -517,6 +753,22 @@ parser.add_option('--chromium-checkout', dest='chromiumcheckout',
                        'branch/hash/tag). This overrides the value specified '+\
                        'by CEF in CHROMIUM_BUILD_COMPATIBILITY.txt.',
                   default='')
+parser.add_option(
+    '--no-chromium-history',
+    action='store_true',
+    dest='nochromiumhistory',
+    default=False,
+    help='Checkout Chromium without history.')
+parser.add_option(
+    '--chromium-archive',
+    dest='chromiumarchive',
+    help='Archive file that contains a single top-level chromium src directory.',
+    default='')
+parser.add_option(
+    '--chromium-archive-sha256',
+    dest='chromiumarchivesha256',
+    help='SHA256 hex-encoded hash for the file passed to --chromium-archive.',
+    default='')
 
 # Miscellaneous options.
 parser.add_option(
@@ -755,13 +1007,31 @@ parser.add_option(
     action='store_true',
     dest='sandboxdistrib',
     default=False,
-    help='Create a cef_sandbox static library distribution.')
+    help='Create a sandbox distribution.')
 parser.add_option(
     '--sandbox-distrib-only',
     action='store_true',
     dest='sandboxdistribonly',
     default=False,
-    help='Create a cef_sandbox static library distribution only.')
+    help='Create a sandbox distribution only.')
+parser.add_option(
+    '--tools-distrib',
+    action='store_true',
+    dest='toolsdistrib',
+    default=False,
+    help='Create a tools distribution.')
+parser.add_option(
+    '--tools-distrib-only',
+    action='store_true',
+    dest='toolsdistribonly',
+    default=False,
+    help='Create a tools distribution only.')
+parser.add_option(
+    '--no-distrib-symbols',
+    action='store_true',
+    dest='nodistribsymbols',
+    default=False,
+    help="Don't create CEF symbol output directories.")
 parser.add_option(
     '--no-distrib-docs',
     action='store_true',
@@ -805,22 +1075,43 @@ if options.noupdate:
   options.nochromiumupdate = True
   options.nodepottoolsupdate = True
 
+if options.chromiumarchive != '':
+  options.nochromiumhistory = True
+
+if options.depottoolsarchivesha256 != '' and \
+   not is_valid_sha256(options.depottoolsarchivesha256):
+  print('Invalid --depot-tools-archive-sha256 value.')
+  parser.print_help(sys.stderr)
+  sys.exit(1)
+
+if options.chromiumarchivesha256 != '' and \
+   not is_valid_sha256(options.chromiumarchivesha256):
+  print('Invalid --chromium-archive-sha256 value.')
+  parser.print_help(sys.stderr)
+  sys.exit(1)
+
 if options.runtests:
   options.buildtests = True
 
-if (options.nochromiumupdate and options.forceupdate) or \
-   (options.nocefupdate and options.forceupdate) or \
-   (options.nobuild and options.forcebuild) or \
-   (options.nodistrib and options.forcedistrib) or \
-   ((options.forceclean or options.forcecleandeps) and options.fastupdate):
-  print("Invalid combination of options.")
-  parser.print_help(sys.stderr)
-  sys.exit(1)
+if (options.nochromiumupdate and options.forceupdate):
+  invalid_options_combination('--no-chromium-update', '--force-update')
+if (options.nocefupdate and options.forceupdate):
+  invalid_options_combination('--no-cef-update', '--force-update')
+if (options.nobuild and options.forcebuild):
+  invalid_options_combination('--no-build', '--force-build')
+if (options.nodistrib and options.forcedistrib):
+  invalid_options_combination('--no-distrib', '--force-distrib')
+if (options.forceclean and options.fastupdate):
+  invalid_options_combination('--force-clean', '--fast-update')
+if (options.forcecleandeps and options.fastupdate):
+  invalid_options_combination('--force-clean-deps', '--fast-update')
+if (options.nochromiumhistory and options.logchromiumchanges):
+  invalid_options_combination('--no-chromium-history', '--log-chromium-changes')
 
 if (options.noreleasebuild and \
      (options.minimaldistrib or options.minimaldistribonly or \
       options.clientdistrib or options.clientdistribonly)) or \
-   (options.minimaldistribonly + options.clientdistribonly + options.sandboxdistribonly > 1):
+   (options.minimaldistribonly + options.clientdistribonly + options.sandboxdistribonly + options.toolsdistribonly > 1):
   print('Invalid combination of options.')
   parser.print_help(sys.stderr)
   sys.exit(1)
@@ -873,27 +1164,13 @@ if not branch_is_master:
     sys.exit(1)
 
   # Verify the minimum supported branch number.
-  if int(cef_branch) < 3071:
+  if int(cef_branch) < 4430:
     print('The requested branch (%s) is too old to build using this tool. ' +
-          'The minimum supported branch is 3071.' % cef_branch)
+          'The minimum supported branch is 4430.' % cef_branch)
     sys.exit(1)
 
-# True if the requested branch is 3538 or newer.
-branch_is_3538_or_newer = (branch_is_master or int(cef_branch) >= 3538)
-
-# True if the requested branch is 3945 or newer.
-branch_is_3945_or_newer = (branch_is_master or int(cef_branch) >= 3945)
-
-# Enable Python 3 usage in Chromium for branches 3945 and newer.
-if branch_is_3945_or_newer and not is_python2 and \
-    not 'GCLIENT_PY3' in os.environ.keys():
-  os.environ['GCLIENT_PY3'] = '1'
-
-if not branch_is_3945_or_newer and \
-  (not is_python2 or bool(int(os.environ.get('GCLIENT_PY3', '0')))):
-  print('Python 3 is not supported with branch 3904 and older ' +
-        '(set GCLIENT_PY3=0 and run with Python 2 executable).')
-  sys.exit(1)
+# True if the requested branch is 7151 or older.
+branch_is_7151_or_older = not branch_is_master and int(cef_branch) <= 7151
 
 if options.armbuild:
   if platform != 'linux':
@@ -907,13 +1184,25 @@ if platform == 'mac' and not (options.x64build or options.arm64build):
         'Add --x64-build or --arm64-build flag to generate a 64-bit build.')
   sys.exit(1)
 
-# Platforms that build a cef_sandbox library.
-sandbox_lib_platforms = ['windows']
-if branch_is_3538_or_newer:
-  sandbox_lib_platforms.append('mac')
+# Platforms that build a cef_sandbox static library in a separate output directory.
+sandbox_static_platforms = []
 
-if not platform in sandbox_lib_platforms and (options.sandboxdistrib or
-                                              options.sandboxdistribonly):
+# Platforms that build a cef_sandbox shared library in the same output directory.
+sandbox_shared_platforms = []
+
+# Platforms that build a bootstrap executable in the same output directory.
+bootstrap_exe_platforms = []
+
+if branch_is_7151_or_older:
+  sandbox_static_platforms.extend(['windows', 'mac'])
+else:
+  bootstrap_exe_platforms.append('windows')
+  sandbox_shared_platforms.append('mac')
+
+if not platform in sandbox_static_platforms and \
+   not platform in sandbox_shared_platforms and \
+   not platform in bootstrap_exe_platforms and \
+   (options.sandboxdistrib or options.sandboxdistribonly):
   print('The sandbox distribution is not supported on this platform.')
   sys.exit(1)
 
@@ -973,34 +1262,40 @@ if not os.path.exists(depot_tools_dir):
 
   if options.depottoolsarchive != '':
     # Extract depot_tools from an archive file.
-    msg('Extracting %s to %s.' % \
-        (options.depottoolsarchive, depot_tools_dir))
+    msg('Extracting %s to %s' % (options.depottoolsarchive, depot_tools_dir))
     if not options.dryrun:
-      download_and_extract(options.depottoolsarchive, depot_tools_dir)
+      download_and_extract(
+          options.depottoolsarchive,
+          depot_tools_dir,
+          sha256_hash=options.depottoolsarchivesha256)
   else:
     # On Linux and OS X check out depot_tools using Git.
     run('git clone ' + depot_tools_url + ' ' + depot_tools_dir, download_dir)
+
+# Add depot_tools to the PATH. This will be inherited by all subprocess calls.
+assert os.path.isdir(depot_tools_dir), depot_tools_dir
+os.environ['PATH'] = depot_tools_dir + os.pathsep + os.environ['PATH']
 
 if not options.nodepottoolsupdate:
   # Update depot_tools.
   # On Windows this will download required python and git binaries.
   msg('Updating depot_tools')
   if platform == 'windows':
-    run('update_depot_tools.bat', depot_tools_dir, depot_tools_dir)
+    run('update_depot_tools.bat', depot_tools_dir)
   else:
-    run('update_depot_tools', depot_tools_dir, depot_tools_dir)
+    run('update_depot_tools', depot_tools_dir)
 
 # Determine the executables to use.
 if platform == 'windows':
-  # Force use of the version bundled with depot_tools.
-  git_exe = os.path.join(depot_tools_dir, 'git.bat')
-  python_bat = 'python.bat' if is_python2 else 'python3.bat'
+  # Force use of the system installed Git version.
+  git_exe = 'git.exe'
+  # Force use of the Python version bundled with depot_tools.
+  python_bat = 'python3.bat'
   python_exe = os.path.join(depot_tools_dir, python_bat)
-  if options.dryrun and not os.path.exists(git_exe):
+  if options.dryrun and not os.path.exists(python_exe):
     sys.stdout.write("WARNING: --dry-run assumes that depot_tools" \
                      " is already in your PATH. If it isn't\nplease" \
                      " specify a --depot-tools-dir value.\n")
-    git_exe = 'git.bat'
     python_exe = python_bat
 else:
   git_exe = 'git'
@@ -1048,8 +1343,7 @@ else:
 # Create the CEF checkout if necessary.
 if not options.nocefupdate and not os.path.exists(cef_dir):
   cef_checkout_new = True
-  run('%s clone %s %s' % (git_exe, cef_url, cef_dir), download_dir,
-      depot_tools_dir)
+  run('%s clone %s %s' % (git_exe, cef_url, cef_dir), download_dir)
 else:
   cef_checkout_new = False
 
@@ -1059,7 +1353,7 @@ if not options.nocefupdate and os.path.exists(cef_dir):
 
   if not cef_checkout_new:
     # Fetch updated sources.
-    run('%s fetch' % (git_exe), cef_dir, depot_tools_dir)
+    run('%s fetch' % (git_exe), cef_dir)
 
   cef_desired_hash = get_git_hash(cef_dir, cef_checkout)
   cef_checkout_changed = cef_checkout_new or force_change or \
@@ -1076,21 +1370,28 @@ if not options.nocefupdate and os.path.exists(cef_dir):
       run_patch_updater("--backup --revert")
 
     # Update the CEF checkout.
-    run('%s checkout %s%s' %
-      (git_exe, '--force ' if discard_local_changes else '', cef_checkout), \
-      cef_dir, depot_tools_dir)
+    run('%s checkout %s%s' % (git_exe, '--force '
+                              if discard_local_changes else '', cef_checkout),
+        cef_dir)
 else:
   cef_checkout_changed = False
 
 build_compat_versions = get_build_compat_versions()
 
+# Determine the Chromium checkout options required by CEF.
+chromium_compat_version = build_compat_versions['chromium_checkout']
+if len(options.chromiumcheckout) > 0:
+  chromium_checkout = options.chromiumcheckout
+else:
+  chromium_checkout = chromium_compat_version
+
 if not options.nodepottoolsupdate and \
     'depot_tools_checkout' in build_compat_versions:
   # Update the depot_tools checkout.
   depot_tools_compat_version = build_compat_versions['depot_tools_checkout']
-  run('%s checkout %s%s' %
-      (git_exe, '--force ' if discard_local_changes else '', depot_tools_compat_version), \
-      depot_tools_dir, depot_tools_dir)
+  run('%s checkout %s%s' % (git_exe, '--force '
+                            if discard_local_changes else '',
+                            depot_tools_compat_version), depot_tools_dir)
 
 # Disable further depot_tools updates.
 os.environ['DEPOT_TOOLS_UPDATE'] = '0'
@@ -1114,88 +1415,123 @@ msg("CEF Output Directory: %s" % (out_dir))
 # Create the chromium directory if necessary.
 create_directory(chromium_dir)
 
+gclient_file = os.path.join(chromium_dir, '.gclient')
+force_config = not os.path.exists(gclient_file) or options.forceconfig
+
+# Extract <version> from a value like 'refs/tags/<version>'.
+chromium_version = chromium_checkout.split('/')[2]
+
+if options.nochromiumhistory and os.path.exists(chromium_src_dir):
+  # When using no history the Chromium checkout must be correct, or it must be deleted/replaced.
+  current_version = read_chrome_version_file(chromium_src_dir)
+  if current_version != chromium_version:
+    error = ''
+    if options.nochromiumupdate:
+      error += ' Remove --no-chromium-update.'
+    if not force_change:
+      error += ' Add --force-clean or --force-update.'
+    if len(error) > 0:
+      raise Exception(
+          'Current Chromium checkout with --no-chromium-history is incorrect.' +
+          error)
+
+    remove_directory(chromium_src_dir)
+    force_config = True
+
 if options.chromiumurl != '':
   chromium_url = options.chromiumurl
 else:
   chromium_url = 'https://chromium.googlesource.com/chromium/src.git'
 
+if options.nochromiumhistory:
+  chromium_url += '@' + chromium_version
+
 # Create gclient configuration file.
-gclient_file = os.path.join(chromium_dir, '.gclient')
-if not os.path.exists(gclient_file) or options.forceconfig:
-  # Exclude unnecessary directories. Intentionally written without newlines.
-  gclient_spec = \
-      "solutions = [{"+\
-        "'managed': False,"+\
-        "'name': 'src', "+\
-        "'url': '" + chromium_url + "', "+\
-        "'custom_vars': {"+\
-          "'checkout_pgo_profiles': " + ('True' if options.withpgoprofiles else 'False') + ", "+\
-        "}, "+\
-        "'custom_deps': {"+\
-          "'build': None, "+\
-          "'build/scripts/command_wrapper/bin': None, "+\
-          "'build/scripts/gsd_generate_index': None, "+\
-          "'build/scripts/private/data/reliability': None, "+\
-          "'build/scripts/tools/deps2git': None, "+\
-          "'build/third_party/lighttpd': None, "+\
-          "'commit-queue': None, "+\
-          "'depot_tools': None, "+\
-          "'src/chrome_frame/tools/test/reference_build/chrome': None, "+\
-          "'src/chrome/tools/test/reference_build/chrome_linux': None, "+\
-          "'src/chrome/tools/test/reference_build/chrome_mac': None, "+\
-          "'src/chrome/tools/test/reference_build/chrome_win': None, "+\
-        "}, "+\
-        "'deps_file': '" + deps_file + "', "+\
-        "'safesync_url': ''"+\
+if force_config:
+  # yapf: disable
+  gclient_spec = (
+      "solutions = [{"+
+        "'managed': False, "+
+        "'name': 'src', "+
+        "'url': '" + chromium_url + "', "+
+        "'custom_vars': {"+
+          "'checkout_pgo_profiles': " + ('True' if options.withpgoprofiles else 'False') + ", "+
+          "'source_tarball': " + ('True' if options.chromiumarchive != '' else 'False') + ", "+
+          "'siso_version': 'latest', "+
+        "}, "+
+        "'custom_deps': {}, "+
+        "'deps_file': '" + deps_file + "', "+
+        "'safesync_url': ''"+
       "}]"
+  )
+  # yapf: disable
 
   msg('Writing %s' % gclient_file)
   if not options.dryrun:
     with open(gclient_file, 'w', encoding='utf-8') as fp:
-      write_fp(fp, gclient_spec)
+      fp.write(gclient_spec)
 
 # Initial Chromium checkout.
 if not options.nochromiumupdate and not os.path.exists(chromium_src_dir):
   chromium_checkout_new = True
-  run("gclient sync --nohooks --with_branch_heads --jobs 16", \
-      chromium_dir, depot_tools_dir)
+  sync_args = '--nohooks '
+
+  if options.chromiumarchive != '':
+    msg('Extracting %s to %s' % (options.chromiumarchive, chromium_src_dir))
+    if not options.dryrun:
+      # Extract without the top-level directory, which has the same name as the archive file.
+      download_and_extract(options.chromiumarchive, chromium_src_dir, strip_components=1,
+                           sha256_hash=options.chromiumarchivesha256)
+
+    # Apply patches required for source tarball support.
+    apply_patch('tarball_deps', chromium_src_dir, required=True)
+    apply_patch('tarball_gclient', depot_tools_dir, required=True)
+  elif options.nochromiumhistory:
+    sync_args += '--no-history'
+  else:
+    sync_args += '--with_branch_heads'
+
+  run("gclient sync %s" % sync_args, chromium_dir)
 else:
   chromium_checkout_new = False
 
 # Verify the Chromium checkout.
-if not options.dryrun and not is_git_checkout(chromium_src_dir):
-  raise Exception('Not a valid git checkout: %s' % (chromium_src_dir))
-
-if os.path.exists(chromium_src_dir):
-  msg("Chromium URL: %s" % (get_git_url(chromium_src_dir)))
-
-# Fetch Chromium changes so that we can perform the necessary calculations using
-# local history.
-if not options.nochromiumupdate and os.path.exists(chromium_src_dir):
-  # Fetch updated sources.
-  run("%s fetch" % (git_exe), chromium_src_dir, depot_tools_dir)
-  # Also fetch tags, which are required for release branch builds.
-  run("%s fetch --tags" % (git_exe), chromium_src_dir, depot_tools_dir)
-
-# Determine the Chromium checkout options required by CEF.
-chromium_compat_version = build_compat_versions['chromium_checkout']
-if len(options.chromiumcheckout) > 0:
-  chromium_checkout = options.chromiumcheckout
+if options.chromiumarchive:
+  current_version = read_chrome_version_file(chromium_src_dir)
+  if current_version != chromium_version:
+    raise Exception('Found Chromium version %s, expected %s at: %s' %
+                    (current_version, chromium_version, chromium_src_dir))
 else:
-  chromium_checkout = chromium_compat_version
+  if not options.dryrun and not is_git_checkout(chromium_src_dir):
+    raise Exception('Not a valid git checkout: %s' % (chromium_src_dir))
 
-# Determine if the Chromium checkout needs to change.
-if not options.nochromiumupdate and os.path.exists(chromium_src_dir):
-  chromium_current_hash = get_git_hash(chromium_src_dir, 'HEAD')
-  chromium_desired_hash = get_git_hash(chromium_src_dir, chromium_checkout)
-  chromium_checkout_changed = chromium_checkout_new or force_change or \
-                              chromium_current_hash != chromium_desired_hash
+  if os.path.exists(chromium_src_dir):
+    msg("Chromium URL: %s" % (get_git_url(chromium_src_dir)))
 
-  msg("Chromium Current Checkout: %s" % (chromium_current_hash))
-  msg("Chromium Desired Checkout: %s (%s)" % \
-      (chromium_desired_hash, chromium_checkout))
+if options.nochromiumhistory:
+  chromium_checkout_changed = chromium_checkout_new
+  msg("Chromium Checkout (no history): %s" % chromium_checkout)
 else:
-  chromium_checkout_changed = options.dryrun
+  # Fetch Chromium changes so that we can perform the necessary calculations using
+  # local history.
+  if not options.nochromiumupdate and os.path.exists(chromium_src_dir):
+    # Fetch updated sources.
+    run("%s fetch" % (git_exe), chromium_src_dir)
+    # Also fetch tags, which are required for release branch builds.
+    run("%s fetch --tags" % (git_exe), chromium_src_dir)
+
+  # Determine if the Chromium checkout needs to change.
+  if not options.nochromiumupdate and os.path.exists(chromium_src_dir):
+    chromium_current_hash = get_git_hash(chromium_src_dir, 'HEAD')
+    chromium_desired_hash = get_git_hash(chromium_src_dir, chromium_checkout)
+    chromium_checkout_changed = chromium_checkout_new or force_change or \
+                                chromium_current_hash != chromium_desired_hash
+
+    msg("Chromium Current Checkout: %s" % (chromium_current_hash))
+    msg("Chromium Desired Checkout: %s (%s)" % \
+        (chromium_desired_hash, chromium_checkout))
+  else:
+    chromium_checkout_changed = options.dryrun
 
 if cef_checkout_changed:
   if cef_dir != cef_src_dir and os.path.exists(cef_src_dir):
@@ -1222,32 +1558,34 @@ if os.path.exists(out_src_dir):
 
 # Update the Chromium checkout.
 if chromium_checkout_changed:
-  if not chromium_checkout_new and not options.fastupdate:
-    if options.forceclean and options.forcecleandeps:
-      # Remove all local changes including third-party git checkouts managed by
-      # gclient.
-      run("%s clean -dffx" % (git_exe), chromium_src_dir, depot_tools_dir)
-    else:
-      # Revert all changes in the Chromium checkout.
-      run("gclient revert --nohooks", chromium_dir, depot_tools_dir)
+  if not options.nochromiumhistory:
+    if not chromium_checkout_new and not options.fastupdate:
+      if options.forceclean and options.forcecleandeps:
+        # Remove all local changes including third-party git checkouts managed by
+        # gclient.
+        run("%s clean -dffx" % (git_exe), chromium_src_dir)
+      else:
+        # Revert all changes in the Chromium checkout.
+        run("gclient revert --nohooks", chromium_dir)
 
-  # Checkout the requested branch.
-  run("%s checkout %s%s" % \
-    (git_exe, '--force ' if discard_local_changes else '', chromium_checkout), \
-    chromium_src_dir, depot_tools_dir)
+    # Checkout the requested branch.
+    run("%s checkout %s%s" %
+      (git_exe, '--force ' if discard_local_changes else '', chromium_checkout),
+      chromium_src_dir)
 
   # Patch the Chromium DEPS file if necessary.
   apply_deps_patch()
 
-  # Update third-party dependencies including branch/tag information.
-  run("gclient sync %s--nohooks --with_branch_heads --jobs 16" % \
-      ('--reset ' if discard_local_changes else ''), chromium_dir, depot_tools_dir)
+  if not options.nochromiumhistory:
+    # Update third-party dependencies including branch/tag information.
+    run("gclient sync %s--nohooks --with_branch_heads" %
+        ('--reset ' if discard_local_changes else ''), chromium_dir)
 
   # Patch the Chromium runhooks scripts if necessary.
   apply_runhooks_patch()
 
   # Runs hooks for files that have been modified in the local working copy.
-  run("gclient runhooks --jobs 16", chromium_dir, depot_tools_dir)
+  run("gclient runhooks", chromium_dir)
 
   # Delete the src/out directory created by `gclient sync`.
   delete_directory(out_src_dir)
@@ -1324,10 +1662,10 @@ if not options.nobuild and (chromium_checkout_changed or \
 
   # Generate project files.
   tool = os.path.join(cef_src_dir, 'tools', 'gclient_hook.py')
-  run('%s %s' % (python_exe, tool), cef_src_dir, depot_tools_dir)
+  run('%s %s' % (python_exe, tool), cef_src_dir)
 
-  # Build using Ninja.
-  command = 'ninja '
+  # Build using autoninja for automatic `-j (#cores)` configuration.
+  command = 'autoninja '
   if options.verbosebuild:
     command += '-v '
   if options.buildfailurelimit != 1:
@@ -1338,6 +1676,8 @@ if not options.nobuild and (chromium_checkout_changed or \
     target += ' ' + options.testtarget
   if platform == 'linux':
     target += ' chrome_sandbox'
+  if platform in bootstrap_exe_platforms:
+    target += ' bootstrap bootstrapc'
 
   # Make a CEF Debug build.
   if not options.nodebugbuild:
@@ -1345,19 +1685,19 @@ if not options.nobuild and (chromium_checkout_changed or \
     args_path = os.path.join(chromium_src_dir, build_path, 'args.gn')
     msg(args_path + ' contents:\n' + read_file(args_path))
 
-    run(command + build_path + target, chromium_src_dir, depot_tools_dir,
-        os.path.join(download_dir, 'build-%s-debug.log' % (cef_branch)) \
+    run(command + build_path + target, chromium_src_dir,
+        os.path.join(download_dir, 'build-%s-debug.log' % (cef_branch))
           if options.buildlogfile else None)
 
-    if platform in sandbox_lib_platforms:
+    if platform in sandbox_static_platforms:
       # Make the separate cef_sandbox build when GN is_official_build=true.
       build_path += '_sandbox'
       if os.path.exists(os.path.join(chromium_src_dir, build_path)):
         args_path = os.path.join(chromium_src_dir, build_path, 'args.gn')
         msg(args_path + ' contents:\n' + read_file(args_path))
 
-        run(command + build_path + ' cef_sandbox', chromium_src_dir, depot_tools_dir,
-            os.path.join(download_dir, 'build-%s-debug-sandbox.log' % (cef_branch)) \
+        run(command + build_path + ' cef_sandbox', chromium_src_dir,
+            os.path.join(download_dir, 'build-%s-debug-sandbox.log' % (cef_branch))
               if options.buildlogfile else None)
 
   # Make a CEF Release build.
@@ -1366,19 +1706,19 @@ if not options.nobuild and (chromium_checkout_changed or \
     args_path = os.path.join(chromium_src_dir, build_path, 'args.gn')
     msg(args_path + ' contents:\n' + read_file(args_path))
 
-    run(command + build_path + target, chromium_src_dir, depot_tools_dir,
-        os.path.join(download_dir, 'build-%s-release.log' % (cef_branch)) \
+    run(command + build_path + target, chromium_src_dir,
+        os.path.join(download_dir, 'build-%s-release.log' % (cef_branch))
           if options.buildlogfile else None)
 
-    if platform in sandbox_lib_platforms:
+    if platform in sandbox_static_platforms:
       # Make the separate cef_sandbox build when GN is_official_build=true.
       build_path += '_sandbox'
       if os.path.exists(os.path.join(chromium_src_dir, build_path)):
         args_path = os.path.join(chromium_src_dir, build_path, 'args.gn')
         msg(args_path + ' contents:\n' + read_file(args_path))
 
-        run(command + build_path + ' cef_sandbox', chromium_src_dir, depot_tools_dir,
-            os.path.join(download_dir, 'build-%s-release-sandbox.log' % (cef_branch)) \
+        run(command + build_path + ' cef_sandbox', chromium_src_dir,
+            os.path.join(download_dir, 'build-%s-release-sandbox.log' % (cef_branch))
               if options.buildlogfile else None)
 
 elif not options.nobuild:
@@ -1410,7 +1750,7 @@ if options.runtests:
     build_path = os.path.join(out_src_dir, get_build_directory_name(True))
     test_path = os.path.join(build_path, test_exe)
     if os.path.exists(test_path):
-      run(test_prefix + test_path + test_args, build_path, depot_tools_dir)
+      run(test_prefix + test_path + test_args, build_path)
     else:
       msg('Not running debug tests. Missing executable: %s' % test_path)
 
@@ -1418,7 +1758,7 @@ if options.runtests:
     build_path = os.path.join(out_src_dir, get_build_directory_name(False))
     test_path = os.path.join(build_path, test_exe)
     if os.path.exists(test_path):
-      run(test_prefix + test_path + test_args, build_path, depot_tools_dir)
+      run(test_prefix + test_path + test_args, build_path)
     else:
       msg('Not running release tests. Missing executable: %s' % test_path)
 
@@ -1428,10 +1768,11 @@ if options.runtests:
 
 if not options.nodistrib and (chromium_checkout_changed or \
                               cef_checkout_changed or options.forcedistrib):
+  artifacts_path = os.path.join(cef_src_dir, 'binary_distrib')
   if not options.forceclean and options.cleanartifacts:
     # Clean the artifacts output directory.
-    artifacts_path = os.path.join(cef_src_dir, 'binary_distrib')
     delete_directory(artifacts_path)
+  create_directory(artifacts_path)
 
   # Determine the requested distribution types.
   distrib_types = []
@@ -1441,6 +1782,8 @@ if not options.nodistrib and (chromium_checkout_changed or \
     distrib_types.append('client')
   elif options.sandboxdistribonly:
     distrib_types.append('sandbox')
+  elif options.toolsdistribonly:
+    distrib_types.append('tools')
   else:
     distrib_types.append('standard')
     if options.minimaldistrib:
@@ -1449,17 +1792,21 @@ if not options.nodistrib and (chromium_checkout_changed or \
       distrib_types.append('client')
     if options.sandboxdistrib:
       distrib_types.append('sandbox')
+    if options.toolsdistrib:
+      distrib_types.append('tools')
 
   cef_tools_dir = os.path.join(cef_src_dir, 'tools')
+
+  commands = []
 
   # Create the requested distribution types.
   first_type = True
   for type in distrib_types:
-    path = '%s make_distrib.py --output-dir=../binary_distrib/' % python_exe
+    path = '%s make_distrib.py --output-dir="%s"' % (python_exe, artifacts_path)
 
     if options.nodebugbuild or options.noreleasebuild or type != 'standard':
       path += ' --allow-partial'
-    path = path + ' --ninja-build'
+    path += ' --ninja-build'
     if options.x64build:
       path += ' --x64-build'
     elif options.armbuild:
@@ -1473,16 +1820,11 @@ if not options.nodistrib and (chromium_checkout_changed or \
       path += ' --client'
     elif type == 'sandbox':
       path += ' --sandbox'
+    elif type == 'tools':
+      path += ' --tools'
 
-    if first_type:
-      if options.nodistribdocs:
-        path += ' --no-docs'
-      if options.nodistribarchive:
-        path += ' --no-archive'
-      first_type = False
-    else:
-      # Don't create the symbol archives or documentation more than once.
-      path += ' --no-symbols --no-docs'
+    if options.nodistribarchive:
+      path += ' --no-archive'
 
     # Override the subdirectory name of binary_distrib if the caller requested.
     if options.distribsubdir != '':
@@ -1490,5 +1832,40 @@ if not options.nodistrib and (chromium_checkout_changed or \
     if options.distribsubdirsuffix != '':
       path += ' --distrib-subdir-suffix=' + options.distribsubdirsuffix
 
+    if platform in ('windows', 'mac') and type in ('standard','sandbox') and \
+       not branch_is_7151_or_older:
+      if not options.nodistribsymbols:
+        # Duplicate the command to create symbols-only distributions.
+        if not options.nodebugbuild:
+          commands.append((path + ' --debug-symbols-only --no-docs', cef_tools_dir))
+        if not options.noreleasebuild:
+          commands.append((path + ' --release-symbols-only --no-docs', cef_tools_dir))
+
+      # No symbols for the original command.
+      path += ' --no-symbols'
+
+    # 'standard' type will always be first, if specified.
+    if first_type:
+      if options.nodistribdocs:
+        path += ' --no-docs'
+      if options.nodistribsymbols and branch_is_7151_or_older:
+        path += ' --no-symbols'
+      first_type = False
+    else:
+      # Don't create the documentation or symbols more than once.
+      path += ' --no-docs'
+      if not ' --no-symbols' in path:
+        path += ' --no-symbols'
+
     # Create the distribution.
-    run(path, cef_tools_dir, depot_tools_dir)
+    commands.append((path, cef_tools_dir))
+
+  commands_ct = len(commands)
+  if commands_ct == 1:
+    command = commands[0]
+    run(command[0], command[1])
+  elif commands_ct > 1:
+    success_ct = run_parallel(commands)
+    if success_ct != commands_ct:
+      print(_stderr_msg(f'ERROR {commands_ct-success_ct} of {commands_ct} commands failed!'))
+      sys.exit(1)
