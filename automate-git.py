@@ -1389,9 +1389,13 @@ if not options.nodepottoolsupdate and \
     'depot_tools_checkout' in build_compat_versions:
   # Update the depot_tools checkout.
   depot_tools_compat_version = build_compat_versions['depot_tools_checkout']
-  run('%s checkout %s%s' % (git_exe, '--force '
-                            if discard_local_changes else '',
-                            depot_tools_compat_version), depot_tools_dir)
+  try:
+    run('%s checkout %s%s' % (git_exe, '--force '
+                              if discard_local_changes else '',
+                              depot_tools_compat_version), depot_tools_dir)
+  except subprocess.CalledProcessError as e:
+    msg('WARNING: Failed to checkout depot_tools to %s (commit may not exist): %s' % (depot_tools_compat_version, str(e)))
+    msg('Continuing with current depot_tools version...')
 
 # Disable further depot_tools updates.
 os.environ['DEPOT_TOOLS_UPDATE'] = '0'
