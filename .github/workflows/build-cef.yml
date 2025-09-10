@@ -51,7 +51,8 @@ jobs:
       run: |
         # 安装必要的工具
         choco install wget -y
-        refreshenv
+        # 更新 PATH 环境变量
+        echo "C:\ProgramData\chocolatey\lib\Wget\tools" >> $env:GITHUB_PATH
     
     - name: Setup Visual Studio environment
       uses: microsoft/setup-msbuild@v2
